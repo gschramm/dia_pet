@@ -12,19 +12,7 @@ Using mamba (recommended)
 mamba env create -f environment.yaml
 ```
 
-## Installation of cupy to run on GPUs
-
-Using conda
-```
-conda activate dia_pet
-conda install -c conda-forge cupy
-```
-
-Using mamba (recommended)
-```
-mamba activate dia_pet
-mamba install cupy
-```
+**If you don't have a CUDA GPU, remove the cupy dependency from environment.yaml**
 
 ## Run
 
