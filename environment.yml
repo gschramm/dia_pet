@@ -1,0 +1,10 @@
+name: dia_pet
+
+channels:
+- conda-forge
+
+dependencies:
+- parallelproj~=1.8
+- pymirc~=0.29
+- ipython
+- cupy<13
