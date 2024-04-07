@@ -33,11 +33,11 @@ elif "torch" in xp.__name__:
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--num_rings", type=int, default=25)
-parser.add_argument("--axial_fov", type=float, default=25.0)
-parser.add_argument("--ring_diameter", type=float, default=76.0)
-parser.add_argument("--crystal_size", type=float, default=1.0)
-parser.add_argument("--scanner_fwhm", type=float, default=2.0)
+parser.add_argument("--num_rings", type=int, default=78)
+parser.add_argument("--axial_fov", type=float, default=100.0)
+parser.add_argument("--ring_diameter", type=float, default=160.0)
+parser.add_argument("--crystal_size", type=float, default=1.12)
+parser.add_argument("--scanner_fwhm", type=float, default=1.25)
 parser.add_argument("--counts", type=int, default=int(1e8))
 parser.add_argument("--num_iter", type=int, default=100)
 parser.add_argument("--contrast", type=float, default=40.0)
@@ -70,22 +70,22 @@ scanner = parallelproj.RegularPolygonPETScannerGeometry(
     xp,
     dev,
     radius=0.5*ring_diameter,
-    num_sides=2*int(0.5*ring_diameter*xp.pi/crystal_size),
+    num_sides=468,
     num_lor_endpoints_per_side=1,
-    lor_spacing=2.0,
-    ring_positions= axial_fov * xp.linspace(-1, 1, num_rings),
+    lor_spacing=crystal_size,
+    ring_positions= 0.5*axial_fov * xp.linspace(-1, 1, num_rings),
     symmetry_axis=2,
 )
 
 voxel_size = (0.25, 0.25, 0.25)
-img_shape = (2*int(24/voxel_size[0]) + 1, 2*int(24/voxel_size[1]) + 1, 2*int(24/voxel_size[2]) + 1)
+img_shape = (2*int(40/voxel_size[0]) + 1, 2*int(40/voxel_size[1]) + 1, 2*int(50/voxel_size[2]) + 1)
 
 # %%
 # setup the LOR descriptor that defines the sinogram
 
 lor_desc = parallelproj.RegularPolygonPETLORDescriptor(
     scanner,
-    radial_trim=20,
+    radial_trim=120,
     sinogram_order=parallelproj.SinogramSpatialAxisOrder.RVP,
 )
 
@@ -93,15 +93,23 @@ proj = parallelproj.RegularPolygonPETProjector(
     lor_desc, img_shape=img_shape, voxel_size=voxel_size
 )
 
+# %%
+# show simulated scanner geometry
+fig2 = plt.figure(figsize=(10, 10))
+ax = fig2.add_subplot(111, projection="3d")
+lor_desc.show_views(ax, views = xp.asarray([0]), planes=xp.asarray([0]))
+proj.show_geometry(ax)
+fig2.show()
 
-# setup a simple test image containing a few "hot rods"
+# %%
+# setup a cylinder test image
 
 X0, X1 = xp.meshgrid(xp.linspace(-1,1,img_shape[0]), xp.linspace(-1,1,img_shape[1]), indexing='ij')
 R = xp.sqrt(X0**2 + X1**2)
 
 x_true = xp.zeros(proj.in_shape, device=dev, dtype=xp.float32)
-for i in range(15, img_shape[2]-15):
-    x_true[:,:,i] = xp.astype(R < 0.8, xp.float32)
+for i in range(2, img_shape[2]-2):
+    x_true[:,:,i] = xp.astype(R < (75/(img_shape[0]*voxel_size[0])), xp.float32)
 
 s = [i//2 - spot_size // 2 for i in img_shape]
 x_true[s[0]:(s[0]+2),s[1]:(s[1]+2),s[2]:(s[2]+2)] = contrast
@@ -110,8 +118,8 @@ x_true[s[0]:(s[0]+2),s[1]:(s[1]+2),s[2]:(s[2]+2)] = contrast
 # Attenuation image and sinogram setup
 # ------------------------------------
 
-# setup an attenuation image
-x_att = 0.01 * xp.astype(x_true > 0, xp.float32)
+# setup an attenuation image in 1/mm
+x_att = 0.03 * xp.astype(x_true > 0, xp.float32)
 # calculate the attenuation sinogram
 att_sino = xp.exp(-proj(x_att))
 
@@ -277,14 +285,6 @@ with PdfPages(pdf_str) as pdf:
     pdf.savefig()
 
     
-# %%
-# show simulated scanner geometry
-fig2 = plt.figure(figsize=(10, 10))
-ax = fig2.add_subplot(111, projection="3d")
-lor_desc.show_views(ax, views = xp.asarray([0]), planes=xp.asarray([0]))
-proj.show_geometry(ax)
-fig2.show()
-
 
 #vi.fig.savefig(f"recons_{time_str}.png")
 #fig.savefig(f"profiles_{time_str}.png")
