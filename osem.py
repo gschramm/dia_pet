@@ -143,35 +143,31 @@ for i, sp_diam in enumerate(sphere_diameters_mm):
 
 del I0, I1, I2, R
 
-####################################################################################
-####################################################################################
-####################################################################################
+# %%
+# Attenuation image and sinogram setup
+# ------------------------------------
 
-## %%
-## Attenuation image and sinogram setup
-## ------------------------------------
+# setup an attenuation image in 1/mm
+x_att = 0.03 * xp.astype(x_true > 0, xp.float32)
+# calculate the attenuation sinogram
+att_sino = xp.exp(-proj(x_att))
+
+
+# %%
+# Complete PET forward model setup
+# --------------------------------
 #
-## setup an attenuation image in 1/mm
-# x_att = 0.03 * xp.astype(x_true > 0, xp.float32)
-## calculate the attenuation sinogram
-# att_sino = xp.exp(-proj(x_att))
-#
-#
-## %%
-## Complete PET forward model setup
-## --------------------------------
-##
-#
-# att_op = parallelproj.ElementwiseMultiplicationOperator(att_sino)
-#
-# res_model = parallelproj.GaussianFilterOperator(
-#    proj.in_shape, sigma=scanner_fwhm / (2.35 * proj.voxel_size)
-# )
-#
-## compose all 3 operators into a single linear operator
-# pet_lin_op = parallelproj.CompositeLinearOperator((att_op, proj, res_model))
-#
-#
+
+att_op = parallelproj.ElementwiseMultiplicationOperator(att_sino)
+
+res_model = parallelproj.GaussianFilterOperator(
+    proj.in_shape, sigma=scanner_fwhm / (2.35 * proj.voxel_size)
+)
+
+# compose all 3 operators into a single linear operator
+pet_lin_op = parallelproj.CompositeLinearOperator((att_op, proj, res_model))
+
+
 ## %%
 ## Simulation of projection data
 ## -----------------------------
