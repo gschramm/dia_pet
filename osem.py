@@ -3,15 +3,12 @@
 from __future__ import annotations
 from array_api_strict._array_object import Array
 import matplotlib.pyplot as plt
-from matplotlib.backends.backend_pdf import PdfPages
 import array_api_compat.numpy as np
 
 import parallelproj
 import pymirc.viewer as pv
 from scipy.ndimage import gaussian_filter
 import array_api_compat.numpy as xp
-
-import time
 
 from copy import copy
 
@@ -40,11 +37,12 @@ parser.add_argument("--ring_diameter", type=float, default=160.0)
 parser.add_argument("--crystal_size", type=float, default=1.12)
 parser.add_argument("--scanner_fwhm", type=float, default=1.25)
 parser.add_argument("--recon_fwhm", type=float, default=0.25)
-parser.add_argument("--counts", type=int, default=int(1e8))
+parser.add_argument("--counts", type=int, default=0)
 parser.add_argument("--num_iter", type=int, default=4)
 parser.add_argument("--num_subsets", type=int, default=26)
 parser.add_argument("--contrast", type=float, default=40.0)
 parser.add_argument("--voxel_size", type=float, default=0.15)
+parser.add_argument("--seed", type=int, default=1)
 
 args = parser.parse_args()
 
@@ -59,6 +57,10 @@ num_iter = args.num_iter
 num_subsets = args.num_subsets
 contrast = args.contrast
 voxel_size = 3 * (args.voxel_size,)
+seed = args.seed
+
+np.random.seed(seed)
+
 # %%
 # Setup of the forward model :math:`\bar{y}(x) = A x + s`
 # --------------------------------------------------------
@@ -135,9 +137,9 @@ del i0, i1, i2
 rho_offset = 10.0 / voxel_size[0]
 i0 = xp.astype(xp.cos(phis) * rho_offset, int)
 i1 = xp.astype(xp.sin(phis) * rho_offset, int)
+i1 = xp.zeros(len(sphere_diameters_mm), dtype=int)
 
 for i, sp_diam in enumerate(sphere_diameters_mm):
-    print(i)
     R = xp.sqrt((I0 - i0[i]) ** 2 + (I1 - i1[i]) ** 2 + I2**2)
     x_true[R < sp_diam / voxel_size[0]] = contrast
 
@@ -158,6 +160,8 @@ att_sino = xp.exp(-proj(x_att))
 # --------------------------------
 #
 
+print("setting up forward model")
+
 att_op = parallelproj.ElementwiseMultiplicationOperator(att_sino)
 
 res_model = parallelproj.GaussianFilterOperator(
@@ -168,183 +172,192 @@ res_model = parallelproj.GaussianFilterOperator(
 pet_lin_op = parallelproj.CompositeLinearOperator((att_op, proj, res_model))
 
 
-## %%
-## Simulation of projection data
-## -----------------------------
-##
-## We setup an arbitrary ground truth :math:`x_{true}` and simulate
-## noise-free and noisy data :math:`y` by adding Poisson noise.
+# %%
+# Simulation of projection data
+# -----------------------------
 #
-## simulated noise-free data
-# noise_free_data = pet_lin_op(x_true)
+# We setup an arbitrary ground truth :math:`x_{true}` and simulate
+# noise-free and noisy data :math:`y` by adding Poisson noise.
+
+print("simulating data")
+
+# simulated noise-free data
+noise_free_data = pet_lin_op(x_true)
+
+if counts > 0:
+    scale_fac = counts / float(xp.sum(noise_free_data))
+    noise_free_data *= scale_fac
+else:
+    scale_fac = 1.0
+
+# generate a contant contamination sinogram
+contamination = xp.full(
+    noise_free_data.shape,
+    0.5 * float(xp.mean(noise_free_data)),
+    device=dev,
+    dtype=xp.float32,
+)
+
+noise_free_data += contamination
+
+if counts > 0:
+    print("adding Poisson noise to the noise-free data")
+    y = xp.asarray(
+        np.random.poisson(parallelproj.to_numpy_array(noise_free_data)),
+        device=dev,
+        dtype=xp.float64,
+    )
+else:
+    y = noise_free_data
+
+# %%
+
+subset_views, subset_slices = proj.lor_descriptor.get_distributed_views_and_slices(
+    num_subsets, len(proj.out_shape)
+)
+
+
+_, subset_slices_non_tof = proj.lor_descriptor.get_distributed_views_and_slices(
+    num_subsets, 3
+)
+
+
+# clear the cached LOR endpoints since we will create many copies of the projector
+
+proj.clear_cached_lor_endpoints()
+pet_subset_linop_seq = []
+
+# we setup a sequence of subset forward operators each constisting of
+# (1) image-based resolution model
+# (2) subset projector
+# (3) multiplication with the corresponding subset of the attenuation sinogram
+
+res_model_recon = parallelproj.GaussianFilterOperator(
+    proj.in_shape, sigma=recon_fwhm / (2.35 * proj.voxel_size)
+)
+
+for i in range(num_subsets):
+    print(f"subset {i:02} containing views {subset_views[i]}")
+    # make a copy of the full projector and reset the views to project
+    subset_proj = copy(proj)
+    subset_proj.views = subset_views[i]
+    if subset_proj.tof:
+        subset_att_op = parallelproj.TOFNonTOFElementwiseMultiplicationOperator(
+            subset_proj.out_shape, att_sino[subset_slices_non_tof[i]]
+        )
+
+    else:
+        subset_att_op = parallelproj.ElementwiseMultiplicationOperator(
+            att_sino[subset_slices_non_tof[i]]
+        )
+
+    # add the resolution model and multiplication with a subset of the attenuation sinogram
+    pet_subset_linop_seq.append(
+        parallelproj.CompositeLinearOperator(
+            [subset_att_op, subset_proj, res_model_recon]
+        )
+    )
+
+pet_subset_linop_seq = parallelproj.LinearOperatorSequence(pet_subset_linop_seq)
+
+# %%
+# EM update to minimize :math:`f(x)`
+# ----------------------------------
 #
-## generate a contant contamination sinogram
-# contamination = xp.full(
-#    noise_free_data.shape,
-#    0.5 * float(xp.mean(noise_free_data)),
-#    device=dev,
-#    dtype=xp.float32,
-# )
+# The EM update that can be used in MLEM or OSEM is given by cite:p:`Dempster1977` :cite:p:`Shepp1982` :cite:p:`Lange1984` :cite:p:`Hudson1994`
 #
-# noise_free_data += contamination
+# .. math::
+#     x^+ = \frac{x}{(A^k)^H 1} (A^k)^H \frac{y^k}{A^k x + s^k}
 #
-# scale_fac = counts / float(xp.sum(noise_free_data))
-# noise_free_data *= scale_fac
-# contamination *= scale_fac
+# to calculate the minimizer of :math:`f(x)` iteratively.
 #
-## add Poisson noise
-# np.random.seed(1)
-# y = xp.asarray(
-#    np.random.poisson(parallelproj.to_numpy_array(noise_free_data)),
-#    device=dev,
-#    dtype=xp.float64,
-# )
+# To monitor the convergence we calculate the relative cost
 #
-## %%
+# .. math::
+#    \frac{f(x) - f(x^*)}{|f(x^*)|}
 #
-# subset_views, subset_slices = proj.lor_descriptor.get_distributed_views_and_slices(
-#    num_subsets, len(proj.out_shape)
-# )
+# and the distance to the optimal point
 #
-#
-# _, subset_slices_non_tof = proj.lor_descriptor.get_distributed_views_and_slices(
-#    num_subsets, 3
-# )
-#
-#
-## clear the cached LOR endpoints since we will create many copies of the projector
-#
-# proj.clear_cached_lor_endpoints()
-# pet_subset_linop_seq = []
-#
-## we setup a sequence of subset forward operators each constisting of
-## (1) image-based resolution model
-## (2) subset projector
-## (3) multiplication with the corresponding subset of the attenuation sinogram
-#
-# res_model_recon = parallelproj.GaussianFilterOperator(
-#    proj.in_shape, sigma=recon_fwhm / (2.35 * proj.voxel_size)
-# )
-#
-# for i in range(num_subsets):
-#    print(f"subset {i:02} containing views {subset_views[i]}")
-#    # make a copy of the full projector and reset the views to project
-#    subset_proj = copy(proj)
-#    subset_proj.views = subset_views[i]
-#    if subset_proj.tof:
-#        subset_att_op = parallelproj.TOFNonTOFElementwiseMultiplicationOperator(
-#            subset_proj.out_shape, att_sino[subset_slices_non_tof[i]]
-#        )
-#
-#    else:
-#        subset_att_op = parallelproj.ElementwiseMultiplicationOperator(
-#            att_sino[subset_slices_non_tof[i]]
-#        )
-#
-#    # add the resolution model and multiplication with a subset of the attenuation sinogram
-#    pet_subset_linop_seq.append(
-#        parallelproj.CompositeLinearOperator([subset_att_op, subset_proj, res_model_recon])
-#    )
-#
-# pet_subset_linop_seq = parallelproj.LinearOperatorSequence(pet_subset_linop_seq)
-#
-## %%
-## EM update to minimize :math:`f(x)`
-## ----------------------------------
-##
-## The EM update that can be used in MLEM or OSEM is given by cite:p:`Dempster1977` :cite:p:`Shepp1982` :cite:p:`Lange1984` :cite:p:`Hudson1994`
-##
-## .. math::
-##     x^+ = \frac{x}{(A^k)^H 1} (A^k)^H \frac{y^k}{A^k x + s^k}
-##
-## to calculate the minimizer of :math:`f(x)` iteratively.
-##
-## To monitor the convergence we calculate the relative cost
-##
-## .. math::
-##    \frac{f(x) - f(x^*)}{|f(x^*)|}
-##
-## and the distance to the optimal point
-##
-## .. math::
-##    \frac{\|x - x^*\|}{\|x^*\|}.
-##
-##
-## We setup a function that calculates a single MLEM/OSEM
-## update given the current solution, a linear forward operator,
-## data, contamination and the adjoint of ones.
-#
-#
-# def em_update(
-#    x_cur: Array,
-#    data: Array,
-#    op: parallelproj.LinearOperator,
-#    s: Array,
-#    adjoint_ones: Array,
-# ) -> Array:
-#    """EM update
-#
-#    Parameters
-#    ----------
-#    x_cur : Array
-#        current solution
-#    data : Array
-#        data
-#    op : parallelproj.LinearOperator
-#        linear forward operator
-#    s : Array
-#        contamination
-#    adjoint_ones : Array
-#        adjoint of ones
-#
-#    Returns
-#    -------
-#    Array
-#        _description_
-#    """
-#    ybar = op(x_cur) + s
-#    return x_cur * op.adjoint(data / ybar) / adjoint_ones
+# .. math::
+#    \frac{\|x - x^*\|}{\|x^*\|}.
 #
 #
-## %%
-## Run the OSEM iterations
-## -----------------------
-#
-## initialize x
-# x = xp.zeros(proj.in_shape, device=dev, dtype=xp.float32)
-# for i in range(5, img_shape[2] - 5):
-#    x[:, :, i] = xp.astype(RHO < 1.0, xp.float32)
-#
-## calculate A_k^H 1 for all subsets k
-# subset_adjoint_ones = []
-#
-# for i, pet_subset_linop in enumerate(pet_subset_linop_seq):
-#    print(f"calculating adjoint of ones for subset {(i+1):02}")
-#    ones_sino = xp.ones(pet_subset_linop.out_shape, device=dev, dtype = xp.float32)
-#    subset_adjoint_ones.append(pet_subset_linop.adjoint(ones_sino))
-#
-## OSEM iterations
-# print("running OSEM iterations")
-# for i in range(num_iter):
-#    for k, sl in enumerate(subset_slices):
-#        print(f"OSEM iteration {(k+1):03} / {(i + 1):03} / {num_iter:03}", end="\r")
-#        x = em_update(
-#            x, y[sl], pet_subset_linop_seq[k], contamination[sl], subset_adjoint_ones[k]
-#        )
-#
-# x /= scale_fac
-#
-## %%
-#
-# x_np = parallelproj.to_numpy_array(x)
-# x_np_2mm = gaussian_filter(
-#    x_np, parallelproj.to_numpy_array(2.0 / (2.35 * proj.voxel_size))
-# )
-# x_np_3mm = gaussian_filter(
-#    x_np, parallelproj.to_numpy_array(3.0 / (2.35 * proj.voxel_size))
-# )
-# x_true_np = parallelproj.to_numpy_array(x_true)
-#
+# We setup a function that calculates a single MLEM/OSEM
+# update given the current solution, a linear forward operator,
+# data, contamination and the adjoint of ones.
+
+
+def em_update(
+    x_cur: Array,
+    data: Array,
+    op: parallelproj.LinearOperator,
+    s: Array,
+    adjoint_ones: Array,
+) -> Array:
+    """EM update
+
+    Parameters
+    ----------
+    x_cur : Array
+        current solution
+    data : Array
+        data
+    op : parallelproj.LinearOperator
+        linear forward operator
+    s : Array
+        contamination
+    adjoint_ones : Array
+        adjoint of ones
+
+    Returns
+    -------
+    Array
+        _description_
+    """
+    ybar = op(x_cur) + s
+    return x_cur * op.adjoint(data / ybar) / adjoint_ones
+
+
+# %%
+# Run the OSEM iterations
+# -----------------------
+
+# initialize x
+x = xp.zeros(proj.in_shape, device=dev, dtype=xp.float32)
+for i in range(5, img_shape[2] - 5):
+    x[:, :, i] = xp.astype(RHO < 1.0, xp.float32)
+
+# calculate A_k^H 1 for all subsets k
+subset_adjoint_ones = []
+
+for i, pet_subset_linop in enumerate(pet_subset_linop_seq):
+    print(f"calculating adjoint of ones for subset {(i+1):02}", end="\r")
+    ones_sino = xp.ones(pet_subset_linop.out_shape, device=dev, dtype=xp.float32)
+    subset_adjoint_ones.append(pet_subset_linop.adjoint(ones_sino))
+print()
+
+# OSEM iterations
+print("running OSEM iterations")
+for i in range(num_iter):
+    for k, sl in enumerate(subset_slices):
+        print(f"OSEM iteration {(k+1):03} / {(i + 1):03} / {num_iter:03}", end="\r")
+        x = em_update(
+            x, y[sl], pet_subset_linop_seq[k], contamination[sl], subset_adjoint_ones[k]
+        )
+
+x /= scale_fac
+
+# %%
+
+x_np = parallelproj.to_numpy_array(x)
+x_np_2mm = gaussian_filter(
+    x_np, parallelproj.to_numpy_array(2.0 / (2.35 * proj.voxel_size))
+)
+x_np_3mm = gaussian_filter(
+    x_np, parallelproj.to_numpy_array(3.0 / (2.35 * proj.voxel_size))
+)
+x_true_np = parallelproj.to_numpy_array(x_true)
+
 # ims = dict(vmin=0.0, vmax=2.0)
 # r = (np.arange(img_shape[0]) - 0.5 * img_shape[0] + 0.5) * voxel_size[0]
 # c = [i // 2 for i in img_shape]
@@ -362,7 +375,7 @@ pet_lin_op = parallelproj.CompositeLinearOperator((att_op, proj, res_model))
 #        axx.legend()
 #        axx.set_xlabel("x [mm]")
 #    ax[0].set_title(
-#        f"spot diam. {(spot_size*voxel_size[0]):.2f} mm, contrast {contrast:.1f}, scanner res {scanner_fwhm:.1f} mm, counts {counts//int(1e6)} mio., it/ss {num_iter}/{num_subsets}",
+#        f"contrast {contrast:.1f}, scanner res {scanner_fwhm:.1f} mm, counts {counts//int(1e6)} mio., it/ss {num_iter}/{num_subsets}",
 #        fontsize="small",
 #    )
 #    ax[0].set_ylim(-0.05, None)
@@ -379,7 +392,6 @@ pet_lin_op = parallelproj.CompositeLinearOperator((att_op, proj, res_model))
 #    )
 #
 #    pdf.savefig()
-#
-## vi.fig.savefig(f"recons_{time_str}.png")
-## fig.savefig(f"profiles_{time_str}.png")
-#
+
+# vi.fig.savefig(f"recons_{time_str}.png")
+# fig.savefig(f"profiles_{time_str}.png")
