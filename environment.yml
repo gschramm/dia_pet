@@ -6,5 +6,6 @@ channels:
 dependencies:
 - parallelproj~=1.8
 - pymirc~=0.29
+- h5py
 - ipython
 - cupy<13

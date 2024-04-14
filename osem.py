@@ -7,6 +7,8 @@ import array_api_compat.numpy as np
 
 import parallelproj
 import pymirc.viewer as pv
+import h5py
+import time
 from scipy.ndimage import gaussian_filter
 import array_api_compat.numpy as xp
 
@@ -31,17 +33,19 @@ elif "torch" in xp.__name__:
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--num_rings", type=int, default=78)
-parser.add_argument("--axial_fov", type=float, default=100.0)
+# parser.add_argument("--num_rings", type=int, default=78)
+parser.add_argument("--num_rings", type=int, default=78 // 3)
+# parser.add_argument("--axial_fov", type=float, default=100.0)
+parser.add_argument("--axial_fov", type=float, default=100.0 / 3)
 parser.add_argument("--ring_diameter", type=float, default=160.0)
 parser.add_argument("--crystal_size", type=float, default=1.12)
 parser.add_argument("--scanner_fwhm", type=float, default=1.25)
-parser.add_argument("--recon_fwhm", type=float, default=0.25)
+parser.add_argument("--recon_fwhm", type=float, default=0.4)
 parser.add_argument("--counts", type=int, default=0)
-parser.add_argument("--num_iter", type=int, default=4)
-parser.add_argument("--num_subsets", type=int, default=26)
+parser.add_argument("--num_iter", type=int, default=1)
+parser.add_argument("--num_subsets", type=int, default=1)
 parser.add_argument("--contrast", type=float, default=40.0)
-parser.add_argument("--voxel_size", type=float, default=0.15)
+parser.add_argument("--voxel_size", type=float, default=0.1)
 parser.add_argument("--seed", type=int, default=1)
 
 args = parser.parse_args()
@@ -72,6 +76,8 @@ np.random.seed(seed)
 #     The MLEM implementation below works with all linear operators that
 #     subclass :class:`.LinearOperator` (e.g. the high-level projectors).
 
+ring_positions = 0.5 * axial_fov * xp.linspace(-1, 1, num_rings)
+
 scanner = parallelproj.RegularPolygonPETScannerGeometry(
     xp,
     dev,
@@ -79,14 +85,14 @@ scanner = parallelproj.RegularPolygonPETScannerGeometry(
     num_sides=468,
     num_lor_endpoints_per_side=1,
     lor_spacing=crystal_size,
-    ring_positions=0.5 * axial_fov * xp.linspace(-1, 1, num_rings),
+    ring_positions=ring_positions,
     symmetry_axis=2,
 )
 
 img_shape = (
     2 * int(40 / voxel_size[0]) + 1,
     2 * int(40 / voxel_size[1]) + 1,
-    2 * int(50 / voxel_size[2]) + 1,
+    2 * int(0.5 * axial_fov / voxel_size[2]) + 1,
 )
 
 # %%
@@ -103,13 +109,13 @@ proj = parallelproj.RegularPolygonPETProjector(
     lor_desc, img_shape=img_shape, voxel_size=voxel_size
 )
 
-## %%
-## show simulated scanner geometry
-# fig2 = plt.figure(figsize=(10, 10))
-# ax = fig2.add_subplot(111, projection="3d")
-# lor_desc.show_views(ax, views=xp.asarray([0]), planes=xp.asarray([0]))
-# proj.show_geometry(ax)
-# fig2.show()
+# %%
+# show simulated scanner geometry
+fig2 = plt.figure(figsize=(10, 10))
+ax = fig2.add_subplot(111, projection="3d")
+lor_desc.show_views(ax, views=xp.asarray([0]), planes=xp.asarray([0]))
+proj.show_geometry(ax)
+fig2.show()
 
 # %%
 # setup a cylinder test image
@@ -124,7 +130,7 @@ for i in range(10, img_shape[2] - 10):
     x_true[:, :, i] = xp.astype(RHO < (75 / (img_shape[0] * voxel_size[0])), xp.float32)
 
 
-sphere_diameters_mm = [0.15, 0.2, 0.3, 0.625, 1.25, 2.5]
+sphere_diameters_mm = [0.3, 0.6, 1.25, 2.0]
 phis = xp.linspace(0, 2 * np.pi, len(sphere_diameters_mm), endpoint=False)
 
 i0 = xp.arange(img_shape[0]) - 0.5 * img_shape[0] + 0.5
@@ -134,14 +140,14 @@ I0, I1, I2 = xp.meshgrid(i0, i1, i2, indexing="ij")
 
 del i0, i1, i2
 
-rho_offset = 10.0 / voxel_size[0]
+rho_offset = 15.0 / voxel_size[0]
 i0 = xp.astype(xp.cos(phis) * rho_offset, int)
 i1 = xp.astype(xp.sin(phis) * rho_offset, int)
-i1 = xp.zeros(len(sphere_diameters_mm), dtype=int)
+i2 = xp.zeros(len(sphere_diameters_mm), dtype=int)
 
-for i, sp_diam in enumerate(sphere_diameters_mm):
+for i, sp_diam_mm in enumerate(sphere_diameters_mm):
     R = xp.sqrt((I0 - i0[i]) ** 2 + (I1 - i1[i]) ** 2 + I2**2)
-    x_true[R < sp_diam / voxel_size[0]] = contrast
+    x_true[R < 0.5 * sp_diam_mm / voxel_size[0]] = contrast
 
 del I0, I1, I2, R
 
@@ -212,54 +218,55 @@ else:
 
 # %%
 
-subset_views, subset_slices = proj.lor_descriptor.get_distributed_views_and_slices(
-    num_subsets, len(proj.out_shape)
-)
-
-
-_, subset_slices_non_tof = proj.lor_descriptor.get_distributed_views_and_slices(
-    num_subsets, 3
-)
-
-
-# clear the cached LOR endpoints since we will create many copies of the projector
-
-proj.clear_cached_lor_endpoints()
-pet_subset_linop_seq = []
-
-# we setup a sequence of subset forward operators each constisting of
-# (1) image-based resolution model
-# (2) subset projector
-# (3) multiplication with the corresponding subset of the attenuation sinogram
-
 res_model_recon = parallelproj.GaussianFilterOperator(
     proj.in_shape, sigma=recon_fwhm / (2.35 * proj.voxel_size)
 )
 
-for i in range(num_subsets):
-    print(f"subset {i:02} containing views {subset_views[i]}")
-    # make a copy of the full projector and reset the views to project
-    subset_proj = copy(proj)
-    subset_proj.views = subset_views[i]
-    if subset_proj.tof:
-        subset_att_op = parallelproj.TOFNonTOFElementwiseMultiplicationOperator(
-            subset_proj.out_shape, att_sino[subset_slices_non_tof[i]]
-        )
-
-    else:
-        subset_att_op = parallelproj.ElementwiseMultiplicationOperator(
-            att_sino[subset_slices_non_tof[i]]
-        )
-
-    # add the resolution model and multiplication with a subset of the attenuation sinogram
-    pet_subset_linop_seq.append(
-        parallelproj.CompositeLinearOperator(
-            [subset_att_op, subset_proj, res_model_recon]
-        )
+if num_subsets > 1:
+    subset_views, subset_slices = proj.lor_descriptor.get_distributed_views_and_slices(
+        num_subsets, len(proj.out_shape)
     )
 
-pet_subset_linop_seq = parallelproj.LinearOperatorSequence(pet_subset_linop_seq)
+    _, subset_slices_non_tof = proj.lor_descriptor.get_distributed_views_and_slices(
+        num_subsets, 3
+    )
 
+    # clear the cached LOR endpoints since we will create many copies of the projector
+
+    proj.clear_cached_lor_endpoints()
+    pet_subset_linop_seq = []
+
+    # we setup a sequence of subset forward operators each constisting of
+    # (1) image-based resolution model
+    # (2) subset projector
+    # (3) multiplication with the corresponding subset of the attenuation sinogram
+
+    for i in range(num_subsets):
+        print(f"subset {i:02} containing views {subset_views[i]}")
+        # make a copy of the full projector and reset the views to project
+        subset_proj = copy(proj)
+        subset_proj.views = subset_views[i]
+        if subset_proj.tof:
+            subset_att_op = parallelproj.TOFNonTOFElementwiseMultiplicationOperator(
+                subset_proj.out_shape, att_sino[subset_slices_non_tof[i]]
+            )
+
+        else:
+            subset_att_op = parallelproj.ElementwiseMultiplicationOperator(
+                att_sino[subset_slices_non_tof[i]]
+            )
+
+        # add the resolution model and multiplication with a subset of the attenuation sinogram
+        pet_subset_linop_seq.append(
+            parallelproj.CompositeLinearOperator(
+                [subset_att_op, subset_proj, res_model_recon]
+            )
+        )
+
+    pet_subset_linop_seq = parallelproj.LinearOperatorSequence(pet_subset_linop_seq)
+
+else:
+    pet_lin_op = parallelproj.CompositeLinearOperator((att_op, proj, res_model_recon))
 # %%
 # EM update to minimize :math:`f(x)`
 # ----------------------------------
@@ -327,22 +334,41 @@ x = xp.zeros(proj.in_shape, device=dev, dtype=xp.float32)
 for i in range(5, img_shape[2] - 5):
     x[:, :, i] = xp.astype(RHO < 1.0, xp.float32)
 
-# calculate A_k^H 1 for all subsets k
-subset_adjoint_ones = []
+if num_subsets > 1:
+    # calculate A_k^H 1 for all subsets k
+    subset_adjoint_ones = []
 
-for i, pet_subset_linop in enumerate(pet_subset_linop_seq):
-    print(f"calculating adjoint of ones for subset {(i+1):02}", end="\r")
-    ones_sino = xp.ones(pet_subset_linop.out_shape, device=dev, dtype=xp.float32)
-    subset_adjoint_ones.append(pet_subset_linop.adjoint(ones_sino))
-print()
+    for i, pet_subset_linop in enumerate(pet_subset_linop_seq):
+        print(f"calculating adjoint of ones for subset {(i+1):02}", end="\r")
+        ones_sino = xp.ones(pet_subset_linop.out_shape, device=dev, dtype=xp.float32)
+        subset_adjoint_ones.append(pet_subset_linop.adjoint(ones_sino))
+    print()
 
-# OSEM iterations
-print("running OSEM iterations")
-for i in range(num_iter):
-    for k, sl in enumerate(subset_slices):
-        print(f"OSEM iteration {(k+1):03} / {(i + 1):03} / {num_iter:03}", end="\r")
+    # OSEM iterations
+    print("running OSEM iterations")
+    for i in range(num_iter):
+        for k, sl in enumerate(subset_slices):
+            print(f"OSEM iteration {(k+1):03} / {(i + 1):03} / {num_iter:03}", end="\r")
+            x = em_update(
+                x,
+                y[sl],
+                pet_subset_linop_seq[k],
+                contamination[sl],
+                subset_adjoint_ones[k],
+            )
+else:
+    adjoint_ones = pet_lin_op.adjoint(
+        xp.ones(pet_lin_op.out_shape, device=dev, dtype=xp.float32)
+    )
+    print("running MLEM iterations")
+    for i in range(num_iter):
+        print(f"MLEM iteration {(i + 1):03} / {num_iter:03}", end="\r")
         x = em_update(
-            x, y[sl], pet_subset_linop_seq[k], contamination[sl], subset_adjoint_ones[k]
+            x,
+            y,
+            pet_lin_op,
+            contamination,
+            adjoint_ones,
         )
 
 x /= scale_fac
@@ -350,14 +376,38 @@ x /= scale_fac
 # %%
 
 x_np = parallelproj.to_numpy_array(x)
-x_np_2mm = gaussian_filter(
-    x_np, parallelproj.to_numpy_array(2.0 / (2.35 * proj.voxel_size))
-)
-x_np_3mm = gaussian_filter(
-    x_np, parallelproj.to_numpy_array(3.0 / (2.35 * proj.voxel_size))
-)
-x_true_np = parallelproj.to_numpy_array(x_true)
 
+x_true_np = parallelproj.to_numpy_array(x_true)
+x_true_sm = gaussian_filter(
+    x_true, parallelproj.to_numpy_array(scanner_fwhm / (2.35 * proj.voxel_size))
+)
+
+# %%
+# save the results
+
+out_file = f"sim_{time.strftime('%Y%m%d-%H%M%S')}.h5"
+
+with h5py.File(out_file, "w") as f:
+    f.create_dataset(
+        "ground_truth", data=x_true_np, compression="gzip", compression_opts=9
+    )
+    f.create_dataset("mlem_recon", data=x_np, compression="gzip", compression_opts=9)
+    f.create_dataset("voxel_size_mm", data=np.array(voxel_size))
+    f.create_dataset("sphere_diameters_mm", data=np.array(sphere_diameters_mm))
+    f.create_dataset("counts", data=counts)
+    f.create_dataset("scanner_fwhm", data=scanner_fwhm)
+    f.create_dataset("recon_fwhm", data=recon_fwhm)
+    f.create_dataset("num_iter", data=num_iter)
+    f.create_dataset("num_subsets", data=num_subsets)
+    f.create_dataset("seed", data=seed)
+
+# x_np_2mm = gaussian_filter(
+#    x_np, parallelproj.to_numpy_array(2.0 / (2.35 * proj.voxel_size))
+# )
+# x_np_3mm = gaussian_filter(
+#    x_np, parallelproj.to_numpy_array(3.0 / (2.35 * proj.voxel_size))
+# )
+#
 # ims = dict(vmin=0.0, vmax=2.0)
 # r = (np.arange(img_shape[0]) - 0.5 * img_shape[0] + 0.5) * voxel_size[0]
 # c = [i // 2 for i in img_shape]
