@@ -44,7 +44,7 @@ parser.add_argument("--counts", type=int, default=int(1e8))
 parser.add_argument("--num_iter", type=int, default=4)
 parser.add_argument("--num_subsets", type=int, default=26)
 parser.add_argument("--contrast", type=float, default=40.0)
-parser.add_argument("--voxel_size", type=float, default=0.1)
+parser.add_argument("--voxel_size", type=float, default=0.15)
 
 args = parser.parse_args()
 
