@@ -40,6 +40,7 @@ parser.add_argument("--axial_fov", type=float, default=100.0)
 parser.add_argument("--ring_diameter", type=float, default=160.0)
 parser.add_argument("--crystal_size", type=float, default=1.12)
 parser.add_argument("--scanner_fwhm", type=float, default=1.25)
+parser.add_argument("--recon_fwhm", type=float, default=1.25)
 parser.add_argument("--counts", type=int, default=int(1e8))
 parser.add_argument("--num_iter", type=int, default=4)
 parser.add_argument("--num_subsets", type=int, default=26)
@@ -53,6 +54,7 @@ axial_fov = args.axial_fov
 ring_diameter = args.ring_diameter
 crystal_size = args.crystal_size
 scanner_fwhm = args.scanner_fwhm
+recon_fwhm = args.recon_fwhm
 counts = args.counts
 num_iter = args.num_iter
 num_subsets = args.num_subsets
@@ -203,6 +205,10 @@ pet_subset_linop_seq = []
 # (2) subset projector
 # (3) multiplication with the corresponding subset of the attenuation sinogram
 
+res_model_recon = parallelproj.GaussianFilterOperator(
+    proj.in_shape, sigma=recon_fwhm / (2.35 * proj.voxel_size)
+)
+
 for i in range(num_subsets):
     print(f"subset {i:02} containing views {subset_views[i]}")
     # make a copy of the full projector and reset the views to project
@@ -220,7 +226,7 @@ for i in range(num_subsets):
 
     # add the resolution model and multiplication with a subset of the attenuation sinogram
     pet_subset_linop_seq.append(
-        parallelproj.CompositeLinearOperator([subset_att_op, subset_proj, res_model])
+        parallelproj.CompositeLinearOperator([subset_att_op, subset_proj, res_model_recon])
     )
 
 pet_subset_linop_seq = parallelproj.LinearOperatorSequence(pet_subset_linop_seq)
@@ -289,7 +295,7 @@ def em_update(
 
 # initialize x
 x = xp.zeros(proj.in_shape, device=dev, dtype=xp.float32)
-for i in range(15, img_shape[2] - 15):
+for i in range(5, img_shape[2] - 5):
     x[:, :, i] = xp.astype(R < 1.0, xp.float32)
 
 # calculate A_k^H 1 for all subsets k
